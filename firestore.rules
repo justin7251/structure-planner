@@ -1,0 +1,32 @@
+rules_version = '2';
+
+// Structure Planner — least-privilege per-user data tree.
+// Deploy: firebase deploy --only firestore:rules
+// (or paste into Console → Firestore Database → Rules and Publish)
+//
+// Data layout written by the app:
+//   users/{uid}              — profile doc (displayName, email, settings)
+//   users/{uid}/tasks/{id}   — task blocks
+//   users/{uid}/logs/{id}    — timer sessions & reflections
+//   users/{uid}/notes/{id}   — quick notes from the Note Taker
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      match /{subcollection}/{document=**} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    // Nothing else in the project is reachable from the client.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+
+  function isOwner(uid) {
+    return request.auth != null && request.auth.uid == uid;
+  }
+}
