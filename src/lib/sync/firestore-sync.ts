@@ -15,6 +15,16 @@
  *     delta pull). Every deletion is mirrored into `users/{uid}/deletions`
  *     and kept locally (store.pendingDeletes) until the cloud confirms —
  *     every device then drops the doc and never re-adds it.
+ *   - Deletions made OUTSIDE the app (Firebase console / REST / another
+ *     client) leave no tombstone — without extra handling the local copy
+ *     would look like a "never-synced local creation" and be re-uploaded
+ *     by the next repair pass. Two defenses close that hole:
+ *       a) live `removed` snapshot changes drop the local copy at once
+ *          (handleExternalDeletions),
+ *       b) the first server snapshot of a session drops any local doc the
+ *          cloud once confirmed (its change clock predates the persisted
+ *          last-clean-sync cutoff) instead of re-uploading it
+ *          (reconcileLocalOnly).
  *   - `applyingRemote` guards against echo loops while writing remote
  *     data into the store.
  *   - Manual sync push/pull are delta-based (cloud-confirmed clocks +
@@ -433,6 +443,165 @@ function applyDeletionDocs(docs: Array<{ id: string; data: DocumentData }>): num
   return removed;
 }
 
+/** Remove docs from the local store WITHOUT echoing back through the
+ *  store→Firestore subscription (applyingRemote skips it), then make the
+ *  deletion durable: tombstone in the cloud `deletions` collection plus a
+ *  best-effort deleteDoc (a no-op when the doc is already gone). Used for
+ *  deletions detected from the server side — the user's delete action in
+ *  the Firebase console or another tab — so they stay deleted everywhere. */
+function dropLocalDocs(kind: DeleteKind, ids: string[], db: Firestore, uid: string): void {
+  if (ids.length === 0) return;
+  applyingRemote = true;
+  try {
+    useAppStore.setState((s) => {
+      if (kind === 'tasks') {
+        const tasks = { ...s.tasks };
+        let changed = false;
+        for (const id of ids) {
+          if (tasks[id] !== undefined) {
+            delete tasks[id];
+            delete pushedClocks.tasks[id];
+            changed = true;
+          }
+        }
+        return changed ? { tasks } : {};
+      }
+      if (kind === 'logs') {
+        const logs = { ...s.logs };
+        let changed = false;
+        for (const id of ids) {
+          if (logs[id] !== undefined) {
+            delete logs[id];
+            delete pushedClocks.logs[id];
+            changed = true;
+          }
+        }
+        return changed ? { logs } : {};
+      }
+      const notes = { ...s.notes };
+      let changed = false;
+      for (const id of ids) {
+        if (notes[id] !== undefined) {
+          delete notes[id];
+          delete pushedClocks.notes[id];
+          changed = true;
+        }
+      }
+      return changed ? { notes } : {};
+    });
+  } finally {
+    applyingRemote = false;
+  }
+  for (const id of ids) {
+    remoteDeleted[kind].add(id);
+    // deletedAt = now — the removal was observed server-side, there is no
+    // original tombstone clock to reuse.
+    writeDeletion(db, uid, kind, id, {});
+    deleteDoc(doc(db, 'users', uid, kind, id)).catch((e) =>
+      warnWriteFailureOnce(`${kind} delete`, e),
+    );
+  }
+}
+
+/**
+ * The server removed these docs while this session was live — either an
+ * outside-the-app delete (Firebase console) or a delete already applied
+ * in another tab. Drop the local copies unconditionally (an observed
+ * server removal is authoritative — this is exactly what previously let
+ * console-deleted records "sync back" from this device) and write
+ * tombstones so every other device converges on the deletion.
+ */
+function handleExternalDeletions(kind: DeleteKind, ids: string[], db: Firestore, uid: string): void {
+  const state = useAppStore.getState();
+  const pending = state.pendingDeletes;
+  const docs =
+    kind === 'tasks' ? state.tasks : kind === 'logs' ? state.logs : state.notes;
+  // Our own in-app deletes also surface as `removed` changes — they are
+  // already handled via pendingDeletes, skip them here.
+  const fresh = ids.filter((id) => docs[id] && !pending[pendingDeleteKey(kind, id)]);
+  dropLocalDocs(kind, fresh, db, uid);
+}
+
+/** Persisted "last completed sync round-trip" clock (per uid). Any doc
+ *  whose change clock predates this cutoff was already in the cloud at
+ *  that moment — if the cloud no longer returns it, it was deleted
+ *  outside the app (no tombstone exists) and must not be re-uploaded. */
+const cleanSyncKey = (uid: string): string => `structure-planner:lastCleanSync:${uid}`;
+function lastCleanSyncAt(uid: string): string {
+  try {
+    return localStorage.getItem(cleanSyncKey(uid)) ?? '';
+  } catch {
+    return '';
+  }
+}
+function rememberCleanSync(uid: string): void {
+  try {
+    localStorage.setItem(cleanSyncKey(uid), new Date().toISOString());
+  } catch {
+    // storage unavailable (private mode) — external-delete detection
+    // degrades to live `removed` events only
+  }
+}
+
+/**
+ * First server-originated snapshot of a session: every local doc missing
+ * from the snapshot is either (a) a never-synced local creation — upload
+ * it, or (b) a doc the cloud once confirmed but no longer returns — it
+ * was deleted outside the app, leaving no tombstone → drop it locally +
+ * write a tombstone so it stays deleted everywhere instead of
+ * resurrecting on the next repair push. (b) is detected with the
+ * persisted last-clean-sync cutoff; without a cutoff yet (no completed
+ * manual sync ever) everything local-only is uploaded, as before.
+ */
+function reconcileLocalOnly(
+  kind: DeleteKind,
+  remoteIds: Set<string>,
+  db: Firestore,
+  uid: string,
+): void {
+  const st = useAppStore.getState();
+  const pending = st.pendingDeletes;
+  const known = remoteDeleted[kind];
+  const localOnly =
+    kind === 'tasks'
+      ? Object.values(st.tasks).filter(
+          (t) => !remoteIds.has(t.id) && !known.has(t.id) && !pending[pendingDeleteKey('tasks', t.id)],
+        )
+      : kind === 'logs'
+        ? Object.values(st.logs).filter(
+            (l) => !remoteIds.has(l.id) && !known.has(l.id) && !pending[pendingDeleteKey('logs', l.id)],
+          )
+        : Object.values(st.notes).filter(
+            (n) => !remoteIds.has(n.id) && !known.has(n.id) && !pending[pendingDeleteKey('notes', n.id)],
+          );
+  if (localOnly.length === 0) return;
+
+  const cutoff = lastCleanSyncAt(uid);
+  const dropIds = new Set<string>();
+  const upload: Array<Task | Log | Note> = [];
+  for (const item of localOnly) {
+    const clock =
+      kind === 'tasks'
+        ? taskClock(item as Task)
+        : kind === 'logs'
+          ? logClock(item as Log)
+          : noteClock(item as Note);
+    // Empty clock = never touched by the sync engine → always upload.
+    if (cutoff && clock && clock <= cutoff) {
+      dropIds.add(item.id);
+    } else {
+      upload.push(item);
+    }
+  }
+  if (dropIds.size > 0) {
+    console.info(
+      `[firestore-sync] dropping ${dropIds.size} ${kind} deleted outside the app (present locally, absent from cloud, clock ≤ last clean sync)`,
+    );
+    dropLocalDocs(kind, [...dropIds], db, uid);
+  }
+  if (upload.length > 0) uploadLocal(kind, upload, db, uid);
+}
+
 /** Mirror a local deletion into the cloud `deletions` collection so other
  *  devices drop the doc too. Uses the store's tombstone clock when the
  *  delete went through a store action (tasks/notes), else now (logs). */
@@ -518,8 +687,8 @@ function bumpPullMark(
  * manual sync stays fast even with years of accumulated history. Empty
  * marks (fresh sign-in, empty cache) naturally degrade to a full pull.
  */
-export async function pullOnce(uid: string): Promise<number> {
-  if (!isFirebaseConfigured || !running || syncedUid !== uid) return 0;
+export async function pullOnce(uid: string): Promise<{ pulled: number; clean: boolean }> {
+  if (!isFirebaseConfigured || !running || syncedUid !== uid) return { pulled: 0, clean: false };
   lastPullAt = Date.now();
   const db: Firestore = getFirebaseDb();
 
@@ -581,16 +750,16 @@ export async function pullOnce(uid: string): Promise<number> {
 
   // A completed round-trip counts as "last sync" even when nothing
   // changed — that timestamp is what the user reads as "contacted cloud".
-  if (
+  const allFulfilled =
     tasksRes.status === 'fulfilled' &&
     logsRes.status === 'fulfilled' &&
     notesRes.status === 'fulfilled' &&
     deletionsRes.status === 'fulfilled' &&
-    profileRes.status === 'fulfilled'
-  ) {
+    profileRes.status === 'fulfilled';
+  if (allFulfilled) {
     markSynced();
   }
-  return pulled;
+  return { pulled, clean: allFulfilled };
 }
 
 interface PushEntry {
@@ -623,7 +792,7 @@ function collectDirty(kind: 'tasks' | 'logs' | 'notes'): PushEntry[] {
  * everything — a deliberate full repair pass); each batch marks its
  * docs' clocks on success only, so failed batches re-push next time.
  */
-async function pushAll(uid: string): Promise<number> {
+async function pushAll(uid: string): Promise<{ pushed: number; clean: boolean }> {
   const db: Firestore = getFirebaseDb();
   const plan = {
     tasks: collectDirty('tasks'),
@@ -635,7 +804,7 @@ async function pushAll(uid: string): Promise<number> {
     ([key, t]) => deletionClocks[key] !== t.deletedAt,
   );
   const total = plan.tasks.length + plan.logs.length + plan.notes.length + tombstones.length;
-  if (total === 0) return 0;
+  if (total === 0) return { pushed: 0, clean: true };
 
   const s = useAppStore.getState();
   let pushed = 0;
@@ -708,7 +877,7 @@ async function pushAll(uid: string): Promise<number> {
     // re-pushed on the next sync (all writes are idempotent).
     useAppStore.getState().clearPendingDeletes(confirmedTombstones);
   }
-  return pushed;
+  return { pushed, clean: failed === 0 };
 }
 
 export type SyncNowResult = {
@@ -741,9 +910,14 @@ export async function syncNow(uid: string): Promise<SyncNowResult> {
       // listeners + store mirror (same session — keep delta state),
       // 4) explicit server pull (delta after the first one).
       stopFirestoreSync();
-      const pushed = await pushAll(uid);
+      const { pushed, clean: pushClean } = await pushAll(uid);
       startFirestoreSync(uid, { freshSession: false });
-      const pulled = await pullOnce(uid);
+      const { pulled, clean: pullClean } = await pullOnce(uid);
+      // A fully clean round-trip means every local doc the cloud wants is
+      // now there — remember the clock so the next session can tell
+      // externally-deleted docs apart from never-synced local creations
+      // (see reconcileLocalOnly).
+      if (pushClean && pullClean) rememberCleanSync(uid);
       markSynced();
       return { pushed, pulled };
     });
@@ -872,25 +1046,26 @@ export function startFirestoreSync(uid: string, opts?: { freshSession?: boolean 
   // ── Firestore → store ────────────────────────────────────────────────
 
   // Tasks
-  let firstTasks = true;
+  let reconciledTasks = false;
   unsubs.push(
     onSnapshot(
       tasksCol,
       (snap) => {
+        // Docs the server removed while this session was live (deleted
+        // outside the app or in another tab) must not linger locally —
+        // a stale copy would be re-uploaded by the next repair push.
+        const removed = snap.docChanges().filter((c) => c.type === 'removed').map((c) => c.doc.id);
+        if (removed.length > 0) handleExternalDeletions('tasks', removed, db, uid);
+
         const applied = applyRemoteTasks(snap.docs.map((d) => ({ id: d.id, data: d.data() })));
         if (applied > 0) markSynced();
 
-        if (firstTasks) {
-          firstTasks = false;
-          const remoteIds = new Set(snap.docs.map((d) => d.id));
-          const pendingDeletes = useAppStore.getState().pendingDeletes;
-          const localTasks = Object.values(useAppStore.getState().tasks).filter(
-            (t) =>
-              !remoteIds.has(t.id) &&
-              !remoteDeleted.tasks.has(t.id) &&
-              !pendingDeletes[pendingDeleteKey('tasks', t.id)],
-          );
-          if (localTasks.length > 0) uploadLocal('tasks', localTasks, db, uid);
+        // The upload decision needs a SERVER snapshot: a cached one still
+        // contains docs the server has since deleted, so trusting it would
+        // resurrect exactly the records we must drop.
+        if (!reconciledTasks && !snap.metadata.fromCache) {
+          reconciledTasks = true;
+          reconcileLocalOnly('tasks', new Set(snap.docs.map((d) => d.id)), db, uid);
         }
       },
       (error) => console.warn('[firestore-sync] tasks listener:', error),
@@ -898,25 +1073,20 @@ export function startFirestoreSync(uid: string, opts?: { freshSession?: boolean 
   );
 
   // Logs
-  let firstLogs = true;
+  let reconciledLogs = false;
   unsubs.push(
     onSnapshot(
       logsCol,
       (snap) => {
+        const removed = snap.docChanges().filter((c) => c.type === 'removed').map((c) => c.doc.id);
+        if (removed.length > 0) handleExternalDeletions('logs', removed, db, uid);
+
         const applied = applyRemoteLogs(snap.docs.map((d) => ({ id: d.id, data: d.data() })));
         if (applied > 0) markSynced();
 
-        if (firstLogs) {
-          firstLogs = false;
-          const remoteIds = new Set(snap.docs.map((d) => d.id));
-          const pendingDeletes = useAppStore.getState().pendingDeletes;
-          const localLogs = Object.values(useAppStore.getState().logs).filter(
-            (l) =>
-              !remoteIds.has(l.id) &&
-              !remoteDeleted.logs.has(l.id) &&
-              !pendingDeletes[pendingDeleteKey('logs', l.id)],
-          );
-          if (localLogs.length > 0) uploadLocal('logs', localLogs, db, uid);
+        if (!reconciledLogs && !snap.metadata.fromCache) {
+          reconciledLogs = true;
+          reconcileLocalOnly('logs', new Set(snap.docs.map((d) => d.id)), db, uid);
         }
       },
       (error) => console.warn('[firestore-sync] logs listener:', error),
@@ -924,25 +1094,20 @@ export function startFirestoreSync(uid: string, opts?: { freshSession?: boolean 
   );
 
   // Notes
-  let firstNotes = true;
+  let reconciledNotes = false;
   unsubs.push(
     onSnapshot(
       notesCol,
       (snap) => {
+        const removed = snap.docChanges().filter((c) => c.type === 'removed').map((c) => c.doc.id);
+        if (removed.length > 0) handleExternalDeletions('notes', removed, db, uid);
+
         const applied = applyRemoteNotes(snap.docs.map((d) => ({ id: d.id, data: d.data() })));
         if (applied > 0) markSynced();
 
-        if (firstNotes) {
-          firstNotes = false;
-          const remoteIds = new Set(snap.docs.map((d) => d.id));
-          const pendingDeletes = useAppStore.getState().pendingDeletes;
-          const localNotes = Object.values(useAppStore.getState().notes).filter(
-            (n) =>
-              !remoteIds.has(n.id) &&
-              !remoteDeleted.notes.has(n.id) &&
-              !pendingDeletes[pendingDeleteKey('notes', n.id)],
-          );
-          if (localNotes.length > 0) uploadLocal('notes', localNotes, db, uid);
+        if (!reconciledNotes && !snap.metadata.fromCache) {
+          reconciledNotes = true;
+          reconcileLocalOnly('notes', new Set(snap.docs.map((d) => d.id)), db, uid);
         }
       },
       (error) => console.warn('[firestore-sync] notes listener:', error),
@@ -998,9 +1163,10 @@ export function startFirestoreSync(uid: string, opts?: { freshSession?: boolean 
   }
 }
 
-/** Batched initial upload of local-only documents (450 per batch).
- *  Successful batches mark their docs as cloud-confirmed so the next
- *  manual sync doesn't re-push them. */
+/** Batched upload of local-only documents (450 per batch), called from
+ *  reconcileLocalOnly for docs the cloud never had. Successful batches
+ *  mark their docs as cloud-confirmed so the next manual sync doesn't
+ *  re-push them. */
 function uploadLocal(
   kind: 'tasks' | 'logs' | 'notes',
   docs: Array<Task | Log | Note>,
