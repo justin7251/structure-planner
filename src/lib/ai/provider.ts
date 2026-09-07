@@ -349,7 +349,7 @@ async function postChatCompletion(
           response_format: { type: 'json_object' },
           // Precision over flourish — a grammar/clarity pass wants deterministic,
           // closely-argued cards, not conversational variety.
-          temperature: 0.2,
+          temperature: 0.4,
           stream: true,
         }),
         signal: controller.signal,

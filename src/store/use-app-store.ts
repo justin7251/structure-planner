@@ -25,6 +25,8 @@ import type {
   Task,
   TaskColor,
 } from '@/types';
+import type { AiReview, ReviewAnswerBlock, ReviewFixEdit } from '@/lib/ai/provider';
+import { applyFixToText, formatAnswerBlocks } from '@/lib/ai/provider';
 
 /**
  * Client state (Zustand) — the local-first source of truth.
@@ -91,6 +93,12 @@ interface AppState {
   logs: Record<string, Log>;
   /** Quick notes from the Note Taker (standalone or linked to any task). */
   notes: Record<string, Note>;
+  /** AI reviews, keyed by note id. Device-local by design — EXCLUDED from
+   *  the Firestore mirror (zero sync-engine surface, plan §6.2). */
+  aiReviews: Record<string, AiReview>;
+  /** AI note review opt-in (plan P5). The API key itself is NOT stored here —
+   *  it lives in its own localStorage entry no serialization touches. */
+  aiEnabled: boolean;
   /** Tombstones awaiting cloud confirmation — persisted, survives restarts. */
   pendingDeletes: Record<string, PendingDelete>;
   activeTimer: ActiveTimer | null;
@@ -149,6 +157,25 @@ interface AppState {
   // ── note taker ───────────────────────────────────────────────
   addNote: (input: NoteInput) => Note;
   deleteNote: (noteId: string) => void;
+
+  // ── AI review (plan §6.2 — device-local slice) ────────
+  setAiEnabled: (enabled: boolean) => void;
+  /** Persist a validated review (or a draft/answer update to one). */
+  saveAiReview: (review: AiReview) => void;
+  /** Draft autosave — quiet and reversible (plan P4). */
+  updateAiReviewDraft: (noteId: string, cardIndex: number, text: string) => void;
+  /** Final-card Save: append answers to the note in one atomic write,
+   *  each marked "added from review", then clear the drafts. */
+  saveReviewAnswers: (
+    noteId: string,
+    blocks: ReviewAnswerBlock[],
+  ) => void;
+  /** User-approved fixes land here: each replaces the FIRST occurrence of
+   *  its find string in the stored note (skipped when the spot is gone),
+   *  and the card is stamped in the review's appliedFixes. One atomic
+   *  write for the whole batch. Draft-mode applies never come through the
+   *  store — a draft has nothing to persist against (plan §4.1). */
+  applyReviewFixesToNote: (noteId: string, edits: ReviewFixEdit[]) => void;
 
   // ── rating (§5) ──────────────────────────────────────────────
   confirmRating: (logId: string, rating: Rating) => void;
@@ -226,6 +253,8 @@ export const useAppStore = create<AppState>()(
       tasks: {},
       logs: {},
       notes: {},
+      aiReviews: {},
+      aiEnabled: false,
       pendingDeletes: {},
       activeTimer: null,
       seededAt: null,
@@ -557,8 +586,12 @@ export const useAppStore = create<AppState>()(
         set((s) => {
           const notes = { ...s.notes };
           delete notes[noteId];
+          // Orphan GC — the review is device-local, nothing to tombstone.
+          const aiReviews = { ...s.aiReviews };
+          delete aiReviews[noteId];
           return {
             notes,
+            aiReviews,
             pendingDeletes: {
               ...s.pendingDeletes,
               [pendingDeleteKey('notes', noteId)]: {
@@ -570,6 +603,93 @@ export const useAppStore = create<AppState>()(
           };
         });
       },
+
+      // ── AI review slice (device-local, plan §6.2) ───────────
+      setAiEnabled: (enabled) => set({ aiEnabled: enabled }),
+
+      saveAiReview: (review) =>
+        set((s) => {
+          const aiReviews = { ...s.aiReviews, [review.noteId]: review };
+          // Bound the slice: keep the most recent 200 (plan §6.2).
+          const ids = Object.keys(aiReviews);
+          if (ids.length > 200) {
+            ids
+              .sort((a, b) => aiReviews[a].createdAt.localeCompare(aiReviews[b].createdAt))
+              .slice(0, ids.length - 200)
+              .forEach((id) => delete aiReviews[id]);
+          }
+          return { aiReviews };
+        }),
+
+      updateAiReviewDraft: (noteId, cardIndex, text) =>
+        set((s) => {
+          const review = s.aiReviews[noteId];
+          if (!review) return s;
+          const drafts = { ...review.drafts };
+          if (text.trim()) drafts[cardIndex] = text;
+          else delete drafts[cardIndex];
+          return { aiReviews: { ...s.aiReviews, [noteId]: { ...review, drafts } } };
+        }),
+
+      saveReviewAnswers: (noteId, blocks) =>
+        set((s) => {
+          const note = s.notes[noteId];
+          const review = s.aiReviews[noteId];
+          if (!note || blocks.length === 0) return s;
+          // Answers join the note as the user's own text, each marked so
+          // provenance stays honest (plan §4.2). One atomic write; the
+          // format is shared with the pre-save draft append.
+          const addition = formatAnswerBlocks(blocks);
+          const nowIso = new Date().toISOString();
+          return {
+            notes: {
+              ...s.notes,
+              [noteId]: { ...note, text: `${note.text}\n\n${addition}`, updatedAt: nowIso },
+            },
+            aiReviews: review
+              ? {
+                  ...s.aiReviews,
+                  [noteId]: { ...review, drafts: {}, answersSavedAt: nowIso },
+                }
+              : s.aiReviews,
+          };
+        }),
+
+      applyReviewFixesToNote: (noteId, edits) =>
+        set((s) => {
+          const note = s.notes[noteId];
+          if (!note || edits.length === 0) return s;
+          // Apply in card order, chaining on the evolving text — fixes were
+          // validated against the same text the user is looking at, but a
+          // spot can disappear (edited away, covered by an earlier fix in
+          // this batch); a vanished spot is skipped, never re-anchored.
+          let text = note.text;
+          const nowIso = new Date().toISOString();
+          const applied: Record<number, string> = {};
+          for (const edit of edits) {
+            const next = applyFixToText(text, edit.find, edit.replaceWith);
+            if (next === null) continue;
+            text = next;
+            applied[edit.cardIndex] = nowIso;
+          }
+          if (Object.keys(applied).length === 0) return s;
+          const review = s.aiReviews[noteId];
+          return {
+            notes: {
+              ...s.notes,
+              [noteId]: { ...note, text, updatedAt: nowIso },
+            },
+            aiReviews: review
+              ? {
+                  ...s.aiReviews,
+                  [noteId]: {
+                    ...review,
+                    appliedFixes: { ...review.appliedFixes, ...applied },
+                  },
+                }
+              : s.aiReviews,
+          };
+        }),
 
       // ── §3.1 manual backfill ──────────────────────────────────
       addManualLog: (input) => {
@@ -746,6 +866,7 @@ export const useAppStore = create<AppState>()(
                   tasks: {},
                   logs: {},
                   notes: {},
+                  aiReviews: {},
                   pendingDeletes: {},
                   activeTimer: null,
                   seededAt: null,
@@ -798,6 +919,8 @@ export const useAppStore = create<AppState>()(
           tasks: {},
           logs: {},
           notes: {},
+          aiReviews: {},
+          aiEnabled: false,
           pendingDeletes: {},
           activeTimer: null,
           seededAt: new Date().toISOString(),
@@ -808,17 +931,20 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: 'structure-planner-v1',
-      version: 4,
+      version: 5,
       storage: createJSONStorage(() => localStorage),
       // v1 → v2: tasks gain Structured-style color/icon; rotate defaults
       // over the stored order so existing plans get a coherent look.
       // v2 → v3: landing gate — existing users have already entered, so
       // they keep going straight to the app.
       // v3 → v4: notes (Note Taker) — nothing to migrate, just default in.
+      // v4 → v5: AI reviews (device-local slice) — nothing to migrate.
       migrate: (persisted, version) => {
         const state = persisted as AppState & { overviewDateKey?: string; hasEnteredApp?: boolean };
         if (!state.notes) state.notes = {};
         if (!state.pendingDeletes) state.pendingDeletes = {};
+        if (!state.aiReviews) state.aiReviews = {};
+        if (state.aiEnabled === undefined) state.aiEnabled = false;
         if (version < 2 && state?.tasks) {
           const ids = Object.keys(state.tasks);
           ids.forEach((id, i) => {
@@ -838,6 +964,8 @@ export const useAppStore = create<AppState>()(
         tasks: state.tasks,
         logs: state.logs,
         notes: state.notes,
+        aiReviews: state.aiReviews,
+        aiEnabled: state.aiEnabled,
         pendingDeletes: state.pendingDeletes,
         activeTimer: state.activeTimer,
         seededAt: state.seededAt,

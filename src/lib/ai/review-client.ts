@@ -11,6 +11,7 @@
  */
 
 import { useAppStore } from '@/store/use-app-store';
+import type { Log } from '@/types';
 import {
   AiReview,
   ReviewError,
@@ -185,7 +186,9 @@ function buildLinkedTaskContext(
   if (!task) return null;
 
   // The latest log for that task on the note's day carries status + actual.
-  let latest = null;
+  // Explicit `Log | null` — an untyped `null` initializer narrows every
+  // later access to `never` and the assignment itself to a type error.
+  let latest: Log | null = null;
   for (const log of Object.values(state.logs)) {
     if (log.taskId !== taskId) continue;
     if (dateKey && log.dateKey !== dateKey) continue;
