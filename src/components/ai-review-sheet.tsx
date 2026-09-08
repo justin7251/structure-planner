@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Check,
   ChevronLeft,
   ChevronRight,
   Lightbulb,
@@ -22,37 +23,118 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { useAppStore } from '@/store/use-app-store';
 import { requestReview } from '@/lib/ai/review-client';
-import { ReviewError, type AiReview, type ReviewCard } from '@/lib/ai/provider';
+import {
+  ReviewError,
+  type AiReview,
+  type ReviewAnswerBlock,
+  type ReviewCard,
+  type ReviewFixEdit,
+} from '@/lib/ai/provider';
 import { friendlyDayLabel } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 
 /**
- * AI review — the card-stack review surface (plan §4.2).
+ * AI review — the review surface (plan §4.2).
  *
- * One finding per screen: a clarity observation (quotes the unclear spot),
- * up to two disambiguation questions, up to three suggested fixes, then a
- * summary card. The stack is swipeable with visible Back/Next fallbacks.
- * The Answer affordance is the one moment text entry happens here, so it
- * locks the stack (swipe off, nav yields to Done) and the field sits
- * directly above the keyboard. Drafts autosave per card and survive
- * close/reopen; nothing touches the note until the final card's Save,
- * which appends in one atomic write marked "added from review".
+ * Two targets, one flow:
+ *   • Pre-save draft (primary entry, plan §4.1): reviews the composer's
+ *     unsaved text. Suggested fixes land in the draft only by explicit user
+ *     tap — Apply on a card, or Apply all suggestions — and typed answers
+ *     are appended on request, so the user sees every change BEFORE saving.
+ *     Nothing here is persisted; a draft has nothing to persist against.
+ *   • Saved note (notes-section entry): the same surface on the stored text;
+ *     applies write through the store in one atomic batch (and are stamped
+ *     on the review, so they survive close/reopen), answers append marked
+ *     "added from review".
+ *
+ * Presentation follows the load (plan §4.2): 1–3 findings render as the
+ * guided stack — one card at a time, swipeable, Back/Next fallbacks — while
+ * 4+ render as a single skimmable report with actions at the end. A five-step
+ * tour is a chore; a five-item list gets read.
+ *
+ * Suggestions are APPLICABLE (prompt v3): each carries find → replaceWith,
+ * rendered as a before/after diff box with an Apply button, and the quoted
+ * spot is highlighted live in the pinned draft strip — stack mode follows
+ * the focused card, report mode highlights on tap of the diff box. The
+ * summary card is a completion state, not an apology: "Review complete" +
+ * what changed + the two decisions that matter (apply-all; for drafts, the
+ * Back-to-editing vs primary Save-draft pair). On md+ screens the surface
+ * goes two-column — the user's own text on the left, the findings on the
+ * right — so the draft keeps its prominence instead of shrinking to a strip.
+ *
+ * The note's own text stays pinned (it collapses only while an answer field
+ * is open on mobile, where the keyboard needs the room). Drafts autosave per
+ * answer card (store-backed for saved notes, in-memory for drafts). The
+ * review itself never edits the target — the user does, one approved edit
+ * at a time.
  */
+
+/** A pre-save draft review target — text that is not in the store yet. */
+export interface ReviewDraftTarget {
+  text: string;
+  taskId: string | null;
+  /** Linked task's day, or today for a quick note. */
+  dateKey: string;
+  /** Per-open identity — the sheet's mount key. Applied fixes flow through
+   *  `text` without touching it; only a NEW open mints a new seq. */
+  seq: number;
+}
+
+/** A saved-note review target — everything the store path needs. */
+interface SavedNoteTarget {
+  id: string;
+  text: string;
+  dateKey: string;
+  taskId: string | null;
+  taskDateKey: string | null;
+  taskTitle: string | null;
+}
+
 export function AiReviewSheet({
   open,
   onOpenChange,
   note,
+  draft,
+  onAddAnswersToDraft,
+  onApplyFixesToDraft,
+  onSaveDraft,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  note: { id: string; text: string; dateKey: string; taskTitle: string | null } | null;
+  /** Saved-note review — cached by content hash, persisted with the note. */
+  note?: {
+    id: string;
+    text: string;
+    dateKey: string;
+    taskId: string | null;
+    taskDateKey?: string | null;
+    taskTitle: string | null;
+  } | null;
+  /** Pre-save draft review — runs on the unsaved text, never persisted. */
+  draft?: ReviewDraftTarget | null;
+  /** Draft mode only: append typed answers into the composer draft. */
+  onAddAnswersToDraft?: (blocks: ReviewAnswerBlock[]) => void;
+  /** Draft mode only: apply user-approved fixes into the composer draft. */
+  onApplyFixesToDraft?: (edits: ReviewFixEdit[]) => void;
+  /** Draft mode only: save the composer draft as-is and close the review. */
+  onSaveDraft?: () => void;
 }) {
   return (
     <FullScreenModal open={open} onOpenChange={onOpenChange}>
       <ModalContent data-testid="ai-review-sheet">
         {open && note && (
-          <ReviewFlow key={note.id} note={note} onClose={() => onOpenChange(false)} />
+          <ReviewFlow key={note.id} saved={note} onClose={() => onOpenChange(false)} />
+        )}
+        {open && !note && draft && (
+          <ReviewFlow
+            key={`draft-${draft.seq}`}
+            draftTarget={draft}
+            onAddAnswersToDraft={onAddAnswersToDraft}
+            onApplyFixesToDraft={onApplyFixesToDraft}
+            onSaveDraft={onSaveDraft}
+            onClose={() => onOpenChange(false)}
+          />
         )}
       </ModalContent>
     </FullScreenModal>
@@ -62,14 +144,40 @@ export function AiReviewSheet({
 type Phase = 'loading' | 'ready' | 'error';
 
 function ReviewFlow({
-  note,
+  saved,
+  draftTarget,
+  onAddAnswersToDraft,
+  onApplyFixesToDraft,
+  onSaveDraft,
   onClose,
 }: {
-  note: { id: string; text: string; dateKey: string; taskTitle: string | null };
+  saved?: {
+    id: string;
+    text: string;
+    dateKey: string;
+    taskId: string | null;
+    taskDateKey?: string | null;
+    taskTitle: string | null;
+  } | null;
+  draftTarget?: ReviewDraftTarget | null;
+  onAddAnswersToDraft?: (blocks: ReviewAnswerBlock[]) => void;
+  onApplyFixesToDraft?: (edits: ReviewFixEdit[]) => void;
+  onSaveDraft?: () => void;
   onClose: () => void;
 }) {
-  const storedReview = useAppStore((s) => s.aiReviews[note.id]);
+  const isDraft = !saved;
+  const noteWord = isDraft ? 'draft' : 'note';
+
+  // Draft answers live in component state — without a note id there is
+  // nothing to persist against; they die with the sheet (plan §6.2).
+  const [localDrafts, setLocalDrafts] = useState<Record<number, string>>({});
+  // Applied-fix stamps for drafts — same story, nothing to persist against.
+  // Saved notes read the store's appliedFixes instead (survives reopen).
+  const [draftApplied, setDraftApplied] = useState<Record<number, string>>({});
+
+  const storedReview = useAppStore((s) => (saved ? s.aiReviews[saved.id] : undefined));
   const saveReviewAnswers = useAppStore((s) => s.saveReviewAnswers);
+  const applyReviewFixesToNote = useAppStore((s) => s.applyReviewFixesToNote);
   const updateAiReviewDraft = useAppStore((s) => s.updateAiReviewDraft);
   const setActiveTab = useAppStore((s) => s.setActiveTab);
 
@@ -87,9 +195,29 @@ function ReviewFlow({
   const summaryIndex = cards.length;
   const [index, setIndex] = useState(0);
 
+  // Adaptive surface (plan §4.2): a short note yields 1–3 findings, which
+  // deserve the focused stack; 4+ findings (a long pasted text) become a
+  // skimmable report — nobody finishes a 5-step tour, but everyone reads a
+  // 5-item list. Same cards, same answer flow, different presentation.
+  const listMode = cards.length >= 4;
+
   // Answering state — the one text-entry moment inside the review surface.
   const [answerFor, setAnswerFor] = useState<number | null>(null);
   const [answerText, setAnswerText] = useState('');
+
+  // The spot currently highlighted in the pinned text strip. The cards quote
+  // spots FROM this text, so the connection is shown, not implied: stack
+  // mode follows the focused card automatically; report mode highlights
+  // when the user taps a fix's diff box.
+  const [highlightFind, setHighlightFind] = useState<string | null>(null);
+
+  // The LIVE target text: an applied fix lands in the composer draft (the
+  // parent updates draftTarget.text) or in the stored note (store write) —
+  // either way this re-renders showing the edited wording.
+  const targetText = saved?.text ?? draftTarget?.text ?? '';
+
+  const applied = isDraft ? draftApplied : (review?.appliedFixes ?? {});
+  const fixesAppliedCount = Object.keys(applied).length;
 
   const aliveRef = useRef(true);
   useEffect(() => {
@@ -99,11 +227,31 @@ function ReviewFlow({
     };
   }, []);
 
+  // Snapshot the review target ONCE, at mount. Load must never re-run just
+  // because an applied fix changed the draft text (and with it the prop
+  // identity) — the sheet remounts per open, so a mount-time snapshot is
+  // always the text the user asked to review.
+  const targetRef = useRef({ saved, draftTarget });
+
   const load = useCallback(async () => {
+    const { saved, draftTarget } = targetRef.current;
     setPhase('loading');
     setErrorMsg('');
     try {
-      const outcome = await requestReview(note.id);
+      const outcome = await requestReview(
+        saved
+          ? {
+              text: saved.text,
+              taskId: saved.taskId,
+              dateKey: saved.taskDateKey ?? saved.dateKey,
+              noteId: saved.id,
+            }
+          : {
+              text: draftTarget!.text,
+              taskId: draftTarget!.taskId,
+              dateKey: draftTarget!.dateKey,
+            },
+      );
       if (!aliveRef.current) return;
       setFetched(outcome.review);
       setCached(outcome.cached);
@@ -118,7 +266,7 @@ function ReviewFlow({
       setCanRetry(code !== 'provider' || !message.includes("today's reviews"));
       setPhase('error');
     }
-  }, [note.id]);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -131,24 +279,31 @@ function ReviewFlow({
 
   const openAnswer = (cardIndex: number) => {
     setAnswerFor(cardIndex);
-    setAnswerText(review?.drafts[cardIndex] ?? '');
+    setAnswerText((isDraft ? localDrafts[cardIndex] : review?.drafts[cardIndex]) ?? '');
   };
 
   const closeAnswer = () => setAnswerFor(null);
 
   const onAnswerChange = (text: string) => {
     setAnswerText(text);
-    // Draft autosave per card — quiet, reversible, survives close (plan P4).
-    updateAiReviewDraft(note.id, answerFor ?? 0, text);
+    // Draft autosave per card — quiet, reversible (plan P4). Store-backed
+    // for saved notes, in-memory for drafts (nothing to persist against).
+    if (isDraft) {
+      const i = answerFor ?? 0;
+      setLocalDrafts((d) => ({ ...d, [i]: text }));
+    } else {
+      updateAiReviewDraft(saved!.id, answerFor ?? 0, text);
+    }
   };
 
-  const answeredCount = review
-    ? Object.values(review.drafts).filter((d) => d.trim()).length
-    : 0;
+  // One typed source for both modes keeps the entries callbacks simple.
+  const answerDrafts: Record<number, string> = isDraft ? localDrafts : (review?.drafts ?? {});
 
-  const saveAnswers = () => {
+  const answeredCount = Object.values(answerDrafts).filter((d) => d.trim()).length;
+
+  const commitAnswers = () => {
     if (!review) return;
-    const blocks = Object.entries(review.drafts)
+    const blocks = Object.entries(answerDrafts)
       .filter(([, text]) => text.trim())
       .sort(([a], [b]) => Number(a) - Number(b))
       .map(([i, answer]) => ({
@@ -156,9 +311,72 @@ function ReviewFlow({
         answer: answer.trim(),
       }));
     if (blocks.length === 0) return;
-    saveReviewAnswers(note.id, blocks);
-    toast.success(`${blocks.length} ${blocks.length === 1 ? 'answer' : 'answers'} added to your note`);
+    const n = blocks.length;
+    if (isDraft) {
+      onAddAnswersToDraft?.(blocks);
+      toast.success(
+        `${n} ${n === 1 ? 'answer' : 'answers'} added to your draft — review it, then save`,
+      );
+    } else {
+      saveReviewAnswers(saved!.id, blocks);
+      toast.success(`${n} ${n === 1 ? 'answer' : 'answers'} added to your note`);
+    }
     onClose();
+  };
+
+  // ── applying fixes (v1.9) — always user-tapped, one approved edit at a time ──
+
+  const applyEdits = (edits: ReviewFixEdit[]) => {
+    if (edits.length === 0) return;
+    if (isDraft) {
+      onApplyFixesToDraft?.(edits);
+      const nowIso = new Date().toISOString();
+      setDraftApplied((a) => {
+        const next = { ...a };
+        for (const e of edits) next[e.cardIndex] = nowIso;
+        return next;
+      });
+    } else {
+      applyReviewFixesToNote(saved!.id, edits);
+    }
+    toast.success(
+      `${edits.length} ${edits.length === 1 ? 'fix' : 'fixes'} applied to your ${noteWord}`,
+    );
+  };
+
+  const applyFix = (cardIndex: number) => {
+    const card = cards[cardIndex];
+    if (card.type !== 'suggestion' || !card.find || !card.replaceWith) return;
+    applyEdits([{ cardIndex, find: card.find, replaceWith: card.replaceWith }]);
+  };
+
+  // Suggestions still applicable: structured fix, not yet applied, and the
+  // quoted spot still present in the current text. Feeds Apply all.
+  const unappliedFixes: ReviewFixEdit[] = [];
+  cards.forEach((card, i) => {
+    if (
+      card.type === 'suggestion' &&
+      card.find &&
+      card.replaceWith &&
+      !applied[i] &&
+      targetText.includes(card.find)
+    ) {
+      unappliedFixes.push({ cardIndex: i, find: card.find, replaceWith: card.replaceWith });
+    }
+  });
+
+  // Stack mode: the highlight follows the focused card. Recomputed from the
+  // LIVE text, so an applied fix clears its own highlight (its spot is gone).
+  useEffect(() => {
+    if (listMode || phase !== 'ready') return;
+    const find = cards[index]?.find;
+    setHighlightFind(find && targetText.includes(find) ? find : null);
+  }, [listMode, phase, index, cards, targetText]);
+
+  // Report mode: highlight on explicit tap of a fix's diff box.
+  const locate = (find: string | null) => {
+    if (!find) return;
+    setHighlightFind(find);
   };
 
   // Swipe navigation — locked while the answer field is open (plan §4.2).
@@ -175,18 +393,39 @@ function ReviewFlow({
     go(dx < 0 ? 1 : -1);
   };
 
-  const title = note.taskTitle ?? 'Quick note';
+  const title = saved?.taskTitle ?? (isDraft ? 'Draft' : 'Quick note');
+
+  // Status line — the state of the document at a glance (v1.9): no
+  // discovering findings by scrolling.
+  const suggestionCount = cards.filter((c) => c.type === 'suggestion').length;
+  const questionCount = cards.filter((c) => c.type === 'question').length;
+  const observationCount = cards.filter((c) => c.type === 'observation').length;
+  const statusParts = [
+    suggestionCount
+      ? `${suggestionCount} ${suggestionCount === 1 ? 'suggestion' : 'suggestions'}`
+      : null,
+    questionCount ? `${questionCount} ${questionCount === 1 ? 'question' : 'questions'}` : null,
+    observationCount ? `${observationCount} ${observationCount === 1 ? 'issue' : 'issues'}` : null,
+  ].filter(Boolean) as string[];
+  const statusText = statusParts.length
+    ? `Review complete · ${statusParts.join(' · ')}`
+    : 'Review complete';
+
+  const onSaveDraftFromReview = () => {
+    if (onSaveDraft) onSaveDraft();
+    else onClose();
+  };
 
   return (
     <div className="flex min-h-0 w-full flex-1 flex-col">
       <ModalTitle className="sr-only">AI review</ModalTitle>
       <ModalDescription className="sr-only">
-        Wording and grammar checks for your note, one at a time
+        Suggestions and clarity checks for your {noteWord}
       </ModalDescription>
 
       {/* Header */}
       <div className="flex shrink-0 items-center justify-between px-4 pb-2 pt-[max(env(safe-area-inset-top),0.75rem)]">
-        <div className="mx-auto flex w-full max-w-md items-center justify-between">
+        <div className="mx-auto flex w-full max-w-md items-center justify-between md:max-w-3xl">
           <div className="flex min-w-0 items-center gap-2">
             <span className="grid size-8 shrink-0 place-items-center rounded-full bg-primary/10">
               <Sparkles className="size-4 text-primary" aria-hidden />
@@ -194,8 +433,8 @@ function ReviewFlow({
             <div className="min-w-0">
               <h2 className="truncate text-[15px] font-semibold leading-tight">{title}</h2>
               <p className="text-xs leading-tight text-muted-foreground">
-                {friendlyDayLabel(note.dateKey)}
-                {cached && ' · saved review'}
+                {isDraft ? 'Draft — not saved yet' : friendlyDayLabel(saved!.dateKey)}
+                {!isDraft && cached && ' · saved review'}
               </p>
             </div>
           </div>
@@ -210,55 +449,148 @@ function ReviewFlow({
         </div>
       </div>
 
-      {/* Body — one card at a time */}
-      <div
-        className="mx-auto flex min-h-0 w-full max-w-md flex-1 flex-col justify-center px-5 py-4"
-        onTouchStart={onTouchStart}
-        onTouchEnd={onTouchEnd}
-      >
-        {phase === 'loading' && <LoadingCard onCancel={onClose} />}
-        {phase === 'error' && (
-          <ErrorCard
-            message={errorMsg}
-            canRetry={canRetry}
-            onRetry={() => void load()}
-            onSettings={() => {
-              onClose();
-              setActiveTab('settings');
-            }}
-            onClose={onClose}
-          />
-        )}
-        {phase === 'ready' && review && (
-          <>
-            {index < summaryIndex ? (
-              <ReviewCardView
-                card={cards[index]}
-                position={index}
-                total={summaryIndex}
-                draft={review.drafts[index]}
-                answering={answerFor === index}
-                answerText={answerText}
-                onAnswerOpen={() => openAnswer(index)}
-                onAnswerChange={onAnswerChange}
-                onAnswerDone={closeAnswer}
+      {/* Body — draft column + findings column. Mobile: the draft pinned
+          above the findings; md+: side-by-side (draft left, findings right),
+          each column scrolling on its own. */}
+      <div className="mx-auto flex min-h-0 w-full max-w-md flex-1 flex-col px-4 pb-4 md:grid md:max-w-3xl md:grid-cols-[minmax(0,5fr)_minmax(0,6fr)] md:gap-6 md:px-6">
+        {/* Draft column — status line + the user's own text, with the
+            highlighted spot marked live. */}
+        <div
+          className={cn(
+            'shrink-0 pt-3 md:order-1 md:min-h-0 md:overflow-y-auto md:pt-4',
+            answerFor !== null && 'hidden md:block',
+          )}
+        >
+          {phase === 'ready' && (
+            <p
+              className="text-center text-[11px] font-bold uppercase tracking-wide text-muted-foreground md:text-left"
+              data-testid="ai-review-status"
+            >
+              {statusText}
+            </p>
+          )}
+          {phase === 'ready' && (
+            <div className="mt-2 rounded-2xl border bg-muted/30 px-3.5 py-2.5">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                Your {noteWord}
+              </p>
+              <DraftHighlight
+                text={targetText}
+                find={highlightFind}
+                testId="ai-review-original-text"
               />
+            </div>
+          )}
+        </div>
+
+        {/* Findings column — guided stack (1–3) or skimmable report (4+) */}
+        <div
+          className={cn(
+            'flex min-h-0 flex-1 flex-col pt-3 md:order-2 md:min-h-0 md:overflow-y-auto md:pt-4',
+            listMode ? 'justify-start overflow-y-auto overscroll-contain' : 'justify-center',
+          )}
+          onTouchStart={listMode ? undefined : onTouchStart}
+          onTouchEnd={listMode ? undefined : onTouchEnd}
+        >
+          {phase === 'loading' && <LoadingCard targetWord={noteWord} onCancel={onClose} />}
+          {phase === 'error' && (
+            <ErrorCard
+              message={errorMsg}
+              canRetry={canRetry}
+              targetWord={noteWord}
+              onRetry={() => void load()}
+              onSettings={() => {
+                onClose();
+                setActiveTab('settings');
+              }}
+              onClose={onClose}
+            />
+          )}
+          {phase === 'ready' && review && (
+            listMode ? (
+              <div className="space-y-2.5">
+                {cards.map((card, i) => (
+                  <ReviewCardView
+                    key={`${card.type}-${i}`}
+                    card={card}
+                    position={i}
+                    total={summaryIndex}
+                    compact
+                    draft={isDraft ? localDrafts[i] : review.drafts[i]}
+                    targetWord={noteWord}
+                    answering={answerFor === i}
+                    answerText={answerText}
+                    onAnswerOpen={() => openAnswer(i)}
+                    onAnswerChange={onAnswerChange}
+                    onAnswerDone={closeAnswer}
+                    applied={!!applied[i]}
+                    findable={!!card.find && !!card.replaceWith && targetText.includes(card.find)}
+                    onApply={() => applyFix(i)}
+                    onLocate={() => locate(card.find ?? null)}
+                  />
+                ))}
+                <SummaryCard
+                  answeredCount={answeredCount}
+                  alreadySaved={!isDraft && review.answersSavedAt !== null}
+                  fixesAppliedCount={fixesAppliedCount}
+                  applyAllCount={unappliedFixes.length}
+                  isDraft={isDraft}
+                  targetWord={noteWord}
+                  onSave={commitAnswers}
+                  onApplyAll={() => applyEdits(unappliedFixes)}
+                  onSaveDraft={isDraft ? onSaveDraftFromReview : undefined}
+                  onClose={onClose}
+                />
+              </div>
             ) : (
-              <SummaryCard
-                answeredCount={answeredCount}
-                alreadySaved={review.answersSavedAt !== null}
-                onSave={saveAnswers}
-                onClose={onClose}
-              />
-            )}
-          </>
-        )}
+              <>
+                {index < summaryIndex ? (
+                  <ReviewCardView
+                    card={cards[index]}
+                    position={index}
+                    total={summaryIndex}
+                    draft={isDraft ? localDrafts[index] : review.drafts[index]}
+                    targetWord={noteWord}
+                    answering={answerFor === index}
+                    answerText={answerText}
+                    onAnswerOpen={() => openAnswer(index)}
+                    onAnswerChange={onAnswerChange}
+                    onAnswerDone={closeAnswer}
+                    applied={!!applied[index]}
+                    findable={
+                      !!cards[index].find &&
+                      !!cards[index].replaceWith &&
+                      targetText.includes(cards[index].find!)
+                    }
+                    onApply={() => applyFix(index)}
+                    onLocate={() => locate(cards[index].find ?? null)}
+                  />
+                ) : (
+                  <SummaryCard
+                    answeredCount={answeredCount}
+                    alreadySaved={!isDraft && review.answersSavedAt !== null}
+                    fixesAppliedCount={fixesAppliedCount}
+                    applyAllCount={unappliedFixes.length}
+                    isDraft={isDraft}
+                    targetWord={noteWord}
+                    onSave={commitAnswers}
+                    onApplyAll={() => applyEdits(unappliedFixes)}
+                    onSaveDraft={isDraft ? onSaveDraftFromReview : undefined}
+                    onClose={onClose}
+                  />
+                )}
+              </>
+            )
+          )}
+        </div>
       </div>
 
-      {/* Footer — dots + nav; nav yields to Done while answering (plan §4.2) */}
-      {phase === 'ready' && (
+      {/* Footer — stack mode: dots + nav; nav yields to Done while answering.
+          Report mode: no tour to navigate — only an open answer field gets a
+          Done bar (answers autosave; the report's actions live at its end). */}
+      {phase === 'ready' && !listMode && (
         <div className="shrink-0 border-t bg-background px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-3">
-          <div className="mx-auto w-full max-w-md">
+          <div className="mx-auto w-full max-w-md md:max-w-3xl">
             {answerFor !== null ? (
               <button
                 onClick={closeAnswer}
@@ -306,6 +638,19 @@ function ReviewFlow({
           </div>
         </div>
       )}
+      {phase === 'ready' && listMode && answerFor !== null && (
+        <div className="shrink-0 border-t bg-background px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-3">
+          <div className="mx-auto w-full max-w-md md:max-w-3xl">
+            <button
+              onClick={closeAnswer}
+              className="h-12 w-full rounded-xl bg-primary text-[15px] font-bold text-primary-foreground shadow-lg shadow-primary/25 transition-transform active:scale-[0.99]"
+              data-testid="ai-answer-done"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -336,21 +681,38 @@ function ReviewCardView({
   position,
   total,
   draft,
+  targetWord,
   answering,
   answerText,
   onAnswerOpen,
   onAnswerChange,
   onAnswerDone,
+  applied,
+  findable,
+  onApply,
+  onLocate,
+  compact = false,
 }: {
   card: ReviewCard;
   position: number;
   total: number;
   draft: string | undefined;
+  targetWord: 'note' | 'draft';
   answering: boolean;
   answerText: string;
   onAnswerOpen: () => void;
   onAnswerChange: (text: string) => void;
   onAnswerDone: () => void;
+  /** A user-approved fix already landed for this card. */
+  applied: boolean;
+  /** The quoted spot is still present in the live text — Apply is possible. */
+  findable: boolean;
+  onApply: () => void;
+  /** Tap the diff box → highlight the spot in the draft strip. */
+  onLocate: () => void;
+  /** Report mode (plan §4.2): denser card, no step counter — a list row,
+   *  not a tour stop. */
+  compact?: boolean;
 }) {
   const meta = CARD_META[card.type];
   const Icon = meta.icon;
@@ -364,12 +726,17 @@ function ReviewCardView({
     }
   }, [answering]);
 
+  const hasFix = card.type === 'suggestion' && !!card.find && !!card.replaceWith;
+
   return (
     <div
-      className="rounded-3xl border bg-card px-5 py-6 shadow-sm"
+      className={cn(
+        'rounded-3xl border bg-card shadow-sm',
+        compact ? 'px-4 py-3.5' : 'px-5 py-6',
+      )}
       data-testid={`ai-card-${card.type}-${position}`}
     >
-      <div className="mb-3 flex items-center justify-between">
+      <div className={cn('flex items-center justify-between', compact ? 'mb-2' : 'mb-3')}>
         <span
           className={cn(
             'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-bold uppercase tracking-wide',
@@ -386,10 +753,82 @@ function ReviewCardView({
         )}
       </div>
 
-      <p className="whitespace-pre-wrap text-[17px] leading-relaxed">{card.text}</p>
-      <p className="mt-4 text-xs tabular-nums text-muted-foreground">
-        {position + 1} of {total + 1}
+      <p
+        className={cn(
+          'whitespace-pre-wrap leading-relaxed',
+          compact ? 'text-[15px]' : 'text-[17px]',
+        )}
+      >
+        {card.text}
       </p>
+
+      {/* Before → after — the recommendation, scannable without reading prose
+          (v1.9). Tapping it highlights the spot in the pinned draft strip. */}
+      {hasFix && (
+        <button
+          type="button"
+          onClick={onLocate}
+          className="mt-3 block w-full overflow-hidden rounded-xl border text-left transition-colors hover:border-foreground/25"
+          aria-label="Show this spot in your draft"
+          data-testid={`ai-fix-diff-${position}`}
+        >
+          <span className="flex items-start gap-2 bg-rose-500/[0.07] px-3 py-2">
+            <span aria-hidden className="shrink-0 font-bold leading-snug text-rose-500/90">
+              −
+            </span>
+            <span className="break-words text-[13px] leading-snug text-muted-foreground line-through decoration-rose-400/50">
+              {card.find}
+            </span>
+          </span>
+          <span className="flex items-start gap-2 border-t bg-emerald-500/[0.08] px-3 py-2">
+            <span
+              aria-hidden
+              className="shrink-0 font-bold leading-snug text-emerald-600 dark:text-emerald-400"
+            >
+              +
+            </span>
+            <span className="break-words text-[13px] font-medium leading-snug">
+              {card.replaceWith}
+            </span>
+          </span>
+        </button>
+      )}
+
+      {/* Apply — the fix lands only by explicit tap (v1.9). After applying,
+          the button becomes a stamped receipt; if the spot is gone from the
+          text, applying is disabled rather than guessing a placement. */}
+      {hasFix &&
+        (applied ? (
+          <span
+            className="mt-3 flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-sm font-semibold text-emerald-700 dark:text-emerald-400"
+            data-testid={`ai-apply-${position}`}
+          >
+            <Check className="size-4" aria-hidden />
+            Applied
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onApply}
+            disabled={!findable}
+            title={findable ? undefined : 'That text is no longer in your draft'}
+            className={cn(
+              'mt-3 flex h-10 w-full items-center justify-center rounded-xl text-sm font-bold transition-transform active:scale-[0.99]',
+              findable
+                ? 'bg-emerald-600 text-white shadow-sm hover:bg-emerald-700'
+                : 'bg-muted text-muted-foreground',
+            )}
+            data-testid={`ai-apply-${position}`}
+          >
+            Apply fix
+          </button>
+        ))}
+
+      {!compact && (
+        <p className="mt-4 text-xs tabular-nums text-muted-foreground">
+          {position + 1} of {total + 1}
+        </p>
+      )}
 
       {card.type === 'question' && !answering && (
         <button
@@ -415,7 +854,7 @@ function ReviewCardView({
             data-testid="ai-answer-input"
           />
           <p className="mt-1.5 text-[11px] text-muted-foreground">
-            Draft saves as you type. It joins your note only when you save on the last card.
+            Saves as you type — nothing joins your {targetWord} until you add it.
           </p>
         </div>
       )}
@@ -426,61 +865,215 @@ function ReviewCardView({
 function SummaryCard({
   answeredCount,
   alreadySaved,
+  fixesAppliedCount,
+  applyAllCount,
+  isDraft,
+  targetWord,
   onSave,
+  onApplyAll,
+  onSaveDraft,
   onClose,
 }: {
   answeredCount: number;
   alreadySaved: boolean;
+  fixesAppliedCount: number;
+  /** Suggestions still applicable — Apply all appears at 2 or more. */
+  applyAllCount: number;
+  isDraft: boolean;
+  targetWord: 'note' | 'draft';
   onSave: () => void;
+  onApplyAll: () => void;
+  onSaveDraft?: () => void;
   onClose: () => void;
 }) {
+  const answersPending = answeredCount > 0 && !alreadySaved;
+
+  // State of the document, in one line — never "No answers to add" (v1.9):
+  // a review that finds nothing to change is still a completed review.
+  const stateLine = [
+    fixesAppliedCount > 0
+      ? `${fixesAppliedCount} ${fixesAppliedCount === 1 ? 'fix' : 'fixes'} applied to your ${targetWord}`
+      : `Your ${targetWord} hasn't been changed`,
+    answersPending
+      ? `${answeredCount} ${answeredCount === 1 ? 'answer' : 'answers'} waiting to be added`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  const support = answersPending
+    ? `Answers join the ${targetWord} as your own text, marked “added from review” — add them, or save without them.`
+    : fixesAppliedCount > 0
+      ? isDraft
+        ? 'The fixes above are in your draft — save it to keep them.'
+        : 'The fixes above are already in your note.'
+      : isDraft
+        ? 'Review the suggestions above, or save your draft as written.'
+        : 'Review the suggestions above, or close when you are done.';
+
   return (
-    <div className="rounded-3xl border bg-card px-5 py-6 text-center shadow-sm" data-testid="ai-summary-card">
+    <div
+      className="rounded-3xl border bg-card px-5 py-6 text-center shadow-sm"
+      data-testid="ai-summary-card"
+    >
       <span className="mx-auto mb-3 grid size-10 place-items-center rounded-full bg-primary/10">
         <Sparkles className="size-5 text-primary" aria-hidden />
       </span>
       {alreadySaved && answeredCount === 0 ? (
-        <p className="text-[15px] font-semibold">Your answers are already in the note.</p>
+        <p className="text-[15px] font-semibold">
+          Your answers are already in the {targetWord}.
+        </p>
       ) : (
         <p className="text-[15px] font-semibold" data-testid="ai-summary-text">
-          {answeredCount === 0
-            ? 'No answers to add — your note stays as written.'
-            : `${answeredCount} ${answeredCount === 1 ? 'answer' : 'answers'} will be added to your note`}
+          Review complete
         </p>
       )}
-      <p className="mx-auto mt-1.5 max-w-[280px] text-xs leading-relaxed text-muted-foreground">
-        Answers join the note as your own text, each marked &ldquo;added from review&rdquo; — so the flagged spot reads clearly later.
+      <p className="mt-1 text-xs font-medium text-muted-foreground" data-testid="ai-summary-state">
+        {stateLine}
+      </p>
+      <p className="mx-auto mt-1.5 max-w-[300px] text-xs leading-relaxed text-muted-foreground">
+        {support}
       </p>
       <div className="mt-5 flex flex-col gap-2">
-        {answeredCount > 0 && (
+        {answersPending && (
           <button
             onClick={onSave}
             className="h-12 w-full rounded-xl bg-primary text-[15px] font-bold text-primary-foreground shadow-lg shadow-primary/25 transition-transform active:scale-[0.99]"
             data-testid="ai-save-answers"
           >
-            Save {answeredCount === 1 ? 'answer' : `${answeredCount} answers`} to note
+            {targetWord === 'draft'
+              ? `Add ${answeredCount === 1 ? '1 answer' : `${answeredCount} answers`} to draft`
+              : `Save ${answeredCount === 1 ? '1 answer' : `${answeredCount} answers`} to note`}
           </button>
         )}
-        <Button variant="outline" className="h-12 rounded-xl" onClick={onClose} data-testid="ai-review-done">
-          Close
-        </Button>
+        {applyAllCount >= 2 && (
+          <button
+            onClick={onApplyAll}
+            className="h-12 w-full rounded-xl border border-emerald-600/40 bg-emerald-500/10 text-[15px] font-bold text-emerald-700 transition-colors hover:bg-emerald-500/20 dark:text-emerald-400"
+            data-testid="ai-apply-all"
+          >
+            Apply all suggestions
+          </button>
+        )}
+        {isDraft ? (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              className="h-12 flex-1 rounded-xl"
+              onClick={onClose}
+              data-testid="ai-review-done"
+            >
+              Back to editing
+            </Button>
+            <button
+              onClick={onSaveDraft}
+              className="h-12 flex-1 rounded-xl bg-primary text-[15px] font-bold text-primary-foreground shadow-lg shadow-primary/25 transition-transform active:scale-[0.99]"
+              data-testid="ai-save-draft"
+            >
+              Save draft
+            </button>
+          </div>
+        ) : (
+          <Button
+            variant="outline"
+            className="h-12 rounded-xl"
+            onClick={onClose}
+            data-testid="ai-review-done"
+          >
+            Close
+          </Button>
+        )}
       </div>
     </div>
   );
 }
 
-function LoadingCard({ onCancel }: { onCancel: () => void }) {
+/**
+ * The pinned draft text with the current spot highlighted. The mark gives
+ * the card↔draft connection a physical anchor; scrolling follows it inside
+ * the strip (block: nearest — nothing else on the page should move).
+ */
+function DraftHighlight({
+  text,
+  find,
+  testId,
+}: {
+  text: string;
+  find: string | null;
+  testId?: string;
+}) {
+  const markRef = useRef<HTMLElement | null>(null);
+  const hit = find ? text.indexOf(find) : -1;
+
+  useEffect(() => {
+    if (hit >= 0) {
+      markRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [hit, find]);
+
+  const pClass =
+    'mt-1 max-h-24 overflow-y-auto overscroll-contain whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90 md:max-h-[420px]';
+
+  if (find && hit >= 0) {
+    return (
+      <p className={pClass} data-testid={testId}>
+        {text.slice(0, hit)}
+        <mark
+          ref={markRef}
+          className="rounded-[3px] bg-amber-300/70 text-inherit transition-colors dark:bg-amber-400/25"
+        >
+          {find}
+        </mark>
+        {text.slice(hit + find.length)}
+      </p>
+    );
+  }
+  return (
+    <p className={pClass} data-testid={testId}>
+      {text}
+    </p>
+  );
+}
+
+function LoadingCard({ targetWord, onCancel }: { targetWord: 'note' | 'draft'; onCancel: () => void }) {
+  // Elapsed ticker — a review through a slow endpoint can legitimately run
+  // past 30s (transport v2 streams, so the wait means progress, not a hang).
+  // A visible clock turns a silent wait into an honest one, and the hint
+  // sets the expectation BEFORE the user decides the request is dead.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
   return (
     <div className="rounded-3xl border bg-card px-5 py-6 shadow-sm" data-testid="ai-loading-card">
       <div className="mb-4 flex items-center gap-2">
         <span className="size-2 animate-pulse rounded-full bg-primary" />
-        <p className="text-sm font-medium text-muted-foreground">Checking your note…</p>
+        <p className="text-sm font-medium text-muted-foreground">Checking your {targetWord}…</p>
+        <span
+          className="ml-auto text-xs tabular-nums text-muted-foreground/70"
+          data-testid="ai-loading-elapsed"
+        >
+          {elapsed}s
+        </span>
       </div>
       <div className="space-y-2.5">
         <div className="h-3.5 w-11/12 animate-pulse rounded bg-muted" />
         <div className="h-3.5 w-full animate-pulse rounded bg-muted" />
         <div className="h-3.5 w-8/12 animate-pulse rounded bg-muted" />
       </div>
+      {elapsed >= 10 && (
+        <p
+          className="mt-4 text-[11px] leading-relaxed text-muted-foreground"
+          data-testid="ai-loading-slow-hint"
+        >
+          Still working — a long text can take up to a minute. You can keep this open, or cancel and try again.
+        </p>
+      )}
+      <p className="mt-4 text-[11px] leading-relaxed text-muted-foreground">
+        Nothing changes on its own — you see every fix and decide.
+      </p>
       <button
         onClick={onCancel}
         className="mt-5 text-xs font-semibold text-muted-foreground underline-offset-2 hover:underline"
@@ -495,12 +1088,14 @@ function LoadingCard({ onCancel }: { onCancel: () => void }) {
 function ErrorCard({
   message,
   canRetry,
+  targetWord,
   onRetry,
   onSettings,
   onClose,
 }: {
   message: string;
   canRetry: boolean;
+  targetWord: 'note' | 'draft';
   onRetry: () => void;
   onSettings: () => void;
   onClose: () => void;
@@ -515,7 +1110,7 @@ function ErrorCard({
         {message}
       </p>
       <p className="mx-auto mt-1.5 max-w-[280px] text-xs leading-relaxed text-muted-foreground">
-        Your note is untouched — reviews never change it on a failed request.
+        Your {targetWord} is untouched — reviews never change it on a failed request.
       </p>
       <div className="mt-5 flex flex-col gap-2">
         {isConfig && (
