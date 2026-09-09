@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, Link2, NotebookPen, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Link2, NotebookPen, Sparkles, X } from 'lucide-react';
 import { addDays, isToday } from 'date-fns';
 import {
   FullScreenModal,
@@ -17,6 +17,13 @@ import { toast } from 'sonner';
 import { dateKeyOf, friendlyDayLabel, parseDayKey, timeOfDay, todayKey } from '@/lib/format';
 import { iconMeta, taskColorMeta } from '@/lib/task-style';
 import { cn } from '@/lib/utils';
+import { AiReviewSheet, type ReviewDraftTarget } from '@/components/ai-review-sheet';
+import {
+  applyFixToText,
+  formatAnswerBlocks,
+  type ReviewAnswerBlock,
+  type ReviewFixEdit,
+} from '@/lib/ai/provider';
 import type { LogStatus, Task } from '@/types';
 
 /** How far back the day picker can go when linking a note to a past task. */
@@ -38,8 +45,18 @@ interface DayAttempt {
  *                     that day's tasks, save. Completed tasks show their
  *                     finish time; pending ones show their slot.
  *
- * Opened from the header/FAB button, or pre-linked from a task's action
- * sheet (noteTakerTaskId preset → the sheet starts attached to that task).
+ * When AI review is enabled, a "Review with AI" button sits directly
+ * above Save (plan §4.1): the review runs on the UNSAVED draft, and any
+ * answers flow back into the draft, so every change is visible before
+ * the note is saved. Opened from the header/FAB button, or pre-linked
+ * from a task's action sheet (noteTakerTaskId preset → the sheet starts
+ * attached to that task).
+ *
+ * Save is the END of the flow (v2.1): the note is written, the sheet
+ * closes itself, and the toast — not a blocking screen — is the entire
+ * confirmation. The old post-save "Find it on Today, under Notes."
+ * interstitial charged a third tap for information the toast already
+ * delivered, on a sheet whose promise was capture in two taps.
  */
 export function NoteTakerSheet() {
   const open = useAppStore((s) => s.noteTakerOpen);
@@ -71,8 +88,12 @@ function NoteTakerFields({
   const tasksRecord = useAppStore((s) => s.tasks);
   const logs = useAppStore((s) => s.logs);
   const addNote = useAppStore((s) => s.addNote);
+  const aiEnabled = useAppStore((s) => s.aiEnabled);
 
   const [text, setText] = useState('');
+  /** Pre-save draft review — the review's target while the note is unsaved. */
+  const [draftReview, setDraftReview] = useState<ReviewDraftTarget | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [linkedTaskId, setLinkedTaskId] = useState<string | null>(presetTaskId ?? null);
   /** Day the linked task belongs to — captured at selection time. */
   const [linkedDateKey, setLinkedDateKey] = useState<string | null>(
@@ -111,7 +132,14 @@ function NoteTakerFields({
 
   const linkedTask = linkedTaskId ? tasksRecord[linkedTaskId] : undefined;
   const canSave = text.trim().length > 0;
+  const online = typeof navigator === 'undefined' ? true : navigator.onLine;
 
+  /**
+   * Save and DONE (v2.1) — the write is the last thing this sheet shows.
+   * The toast carries the outcome (linked task, when there is one); a
+   * quick note needs no description because the new note is visible on
+   * Today the moment the sheet closes. No interstitial, no Done tap.
+   */
   const save = () => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -123,9 +151,57 @@ function NoteTakerFields({
     toast.success('Note saved', {
       description: note.taskTitle
         ? `Linked to "${note.taskTitle}"${linkedDateKey && linkedDateKey !== todayKey() ? ` · ${friendlyDayLabel(linkedDateKey)}` : ''}`
-        : 'Quick note — find it on Today',
+        : undefined,
     });
     onCancel();
+  };
+
+  // Pre-save review (plan §4.1): the button sits above Save so the check
+  // happens BEFORE saving — fixes land in the draft, then the user saves.
+  // `seq` is the sheet's per-open mount key: it stays constant while fixes
+  // edit the text, and changes only when a NEW review is opened.
+  const openDraftReview = () => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setDraftReview({
+      text: trimmed,
+      taskId: linkedTaskId,
+      dateKey: linkedTaskId ? (linkedDateKey ?? todayKey()) : todayKey(),
+      seq: Date.now(),
+    });
+    setReviewOpen(true);
+  };
+
+  /** Draft-mode answers join the composer text — visible before Save. */
+  const addAnswersToDraft = (blocks: ReviewAnswerBlock[]) => {
+    const addition = formatAnswerBlocks(blocks);
+    setText((prev) => (prev.trim() ? `${prev.trimEnd()}\n\n${addition}` : addition));
+  };
+
+  /** Draft-mode fixes: each edit replaces its exact quoted spot (chained in
+   *  card order, skipped when a spot is gone) — in the composer text AND the
+   *  review's live snapshot, so the sheet's strip shows the new wording.
+   *  The stable `seq` key keeps the review mounted while the text changes. */
+  const applyFixesToDraft = (edits: ReviewFixEdit[]) => {
+    const applyAll = (t: string) => {
+      let next = t;
+      for (const edit of edits) {
+        const r = applyFixToText(next, edit.find, edit.replaceWith);
+        if (r !== null) next = r;
+      }
+      return next;
+    };
+    setText(applyAll);
+    setDraftReview((d) => (d ? { ...d, text: applyAll(d.text) } : d));
+  };
+
+  /** The review's Save draft: the composer saves what it has — applied
+   *  fixes and prior additions included — and everything closes at once:
+   *  review, composer, done. The note is already on Today when the
+   *  sheets are gone; nothing is re-reviewed or re-decided here. */
+  const saveDraftFromReview = () => {
+    setReviewOpen(false);
+    save();
   };
 
   return (
@@ -279,25 +355,66 @@ function NoteTakerFields({
         )}
       </div>
 
-      {/* Pinned footer — save is always reachable */}
+      {/* Pinned footer — Review above Save: check the draft BEFORE saving */}
       <div className="shrink-0 border-t bg-background px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-3">
         <div className="mx-auto w-full max-w-md">
-        <button
-          onClick={save}
-          disabled={!canSave}
-          className={cn(
-            'h-12 w-full rounded-xl text-[15px] font-bold transition-transform active:scale-[0.99]',
-            canSave
-              ? 'bg-primary text-primary-foreground shadow-lg shadow-primary/25'
-              : 'bg-muted text-muted-foreground',
+          {aiEnabled && canSave && (
+            <DraftReviewButton online={online} onOpen={openDraftReview} />
           )}
-          data-testid="note-save"
-        >
-          Save note
-        </button>
+          <button
+            onClick={save}
+            disabled={!canSave}
+            className={cn(
+              'h-12 w-full rounded-xl text-[15px] font-bold transition-transform active:scale-[0.99]',
+              canSave
+                ? 'bg-primary text-primary-foreground shadow-lg shadow-primary/25'
+                : 'bg-muted text-muted-foreground',
+            )}
+            data-testid="note-save"
+          >
+            Save note
+          </button>
         </div>
       </div>
+
+      {/* Pre-save draft review — fixes and answers flow back into the
+          composer text, every change visible before Save */}
+      {reviewOpen && draftReview && (
+        <AiReviewSheet
+          open
+          onOpenChange={(o) => !o && setReviewOpen(false)}
+          draft={draftReview}
+          onAddAnswersToDraft={addAnswersToDraft}
+          onApplyFixesToDraft={applyFixesToDraft}
+          onSaveDraft={saveDraftFromReview}
+        />
+      )}
     </div>
+  );
+}
+
+/** The pre-save review entry: secondary styling, Save stays primary. */
+function DraftReviewButton({ online, onOpen }: { online: boolean; onOpen: () => void }) {
+  return (
+    <>
+      <button
+        onClick={onOpen}
+        disabled={!online}
+        className={cn(
+          'mb-2 flex h-12 w-full items-center justify-center gap-2 rounded-xl border text-[15px] font-semibold transition-colors',
+          online ? 'hover:bg-muted/60' : 'opacity-50',
+        )}
+        data-testid="note-review-cta"
+      >
+        <Sparkles className="size-4 text-primary" aria-hidden />
+        Review with AI
+      </button>
+      {!online && (
+        <p className="mb-2 text-center text-xs text-muted-foreground">
+          Review needs a connection — save now, review it afterwards from the note.
+        </p>
+      )}
+    </>
   );
 }
 

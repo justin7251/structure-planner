@@ -1,6 +1,6 @@
 'use client';
 
-import { Link2, NotebookPen, Trash2 } from 'lucide-react';
+import { Link2, NotebookPen, Sparkles, Trash2 } from 'lucide-react';
 import { friendlyDayLabel, timeOfDay, todayKey } from '@/lib/format';
 import type { Note } from '@/types';
 
@@ -17,11 +17,14 @@ export type NoteOutcome = 'done' | 'missed';
 export function NoteCard({
   note,
   onDelete,
+  onReview,
   outcome = null,
   testidPrefix = 'note-item',
 }: {
   note: Note;
   onDelete: () => void;
+  /** Present only when AI review is enabled — adds the review action. */
+  onReview?: () => void;
   /** Whether the linked task was completed that day (Week review only). */
   outcome?: NoteOutcome | null;
   /** data-testid namespace, so each surface keeps its own hooks. */
@@ -64,6 +67,16 @@ export function NoteCard({
         )}
         <span className="tabular-nums">{timeOfDay(note.createdAt)}</span>
       </div>
+      {onReview && (
+        <button
+          onClick={onReview}
+          aria-label={`Review note with AI: ${note.text.slice(0, 40)}`}
+          data-testid={`${testidPrefix}-review-${note.id}`}
+          className="absolute right-10 top-2.5 grid size-7 place-items-center rounded-md text-muted-foreground/50 transition-colors hover:bg-primary/10 hover:text-primary"
+        >
+          <Sparkles className="size-3.5" aria-hidden />
+        </button>
+      )}
       <button
         onClick={onDelete}
         aria-label={`Delete note: ${note.text.slice(0, 40)}`}
