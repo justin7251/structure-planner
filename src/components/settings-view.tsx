@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { format, isToday } from 'date-fns';
-import { ArchiveRestore, ArrowLeft, Bell, Database, Download, LogOut, Moon, RefreshCw, Sun, Trash2, UserRound } from 'lucide-react';
+import { ArchiveRestore, ArrowLeft, Bell, Database, Download, ExternalLink, KeyRound, LogOut, Moon, RefreshCw, Sparkles, Sun, Trash2, UserRound } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { toast } from 'sonner';
 import { selectArchivedTasks, useAppStore } from '@/store/use-app-store';
@@ -30,6 +30,14 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import { formatDuration, dateKeyOf } from '@/lib/format';
+import {
+  DAILY_REVIEW_CAP,
+  clearApiKey,
+  describeApiKey,
+  getApiKey,
+  getUsageToday,
+  setApiKey,
+} from '@/lib/ai/review-client';
 import { buildExportCsv, buildExportJson, downloadTextFile } from '@/lib/export';
 import { cn } from '@/lib/utils';
 
@@ -47,6 +55,7 @@ export function SettingsView() {
       <SyncCard />
       <ThresholdCard />
       <NotificationsCard />
+      <AiCard />
       <AppearanceCard />
       <ArchivedCard />
       <DataCard />
@@ -351,6 +360,171 @@ function NotificationsCard() {
           <Bell className="size-3.5" aria-hidden />
           Send a test notification
         </button>
+      )}
+    </Section>
+  );
+}
+
+/**
+ * AI note review opt-in (plan P5 + §7). Off until enabled here; enabling
+ * shows the disclosure and asks for the user's OWN provider key (BYOK —
+ * plan §6.1). The key lives in its own localStorage entry, outside the
+ * synced store, and can be removed in one tap. Usage shows the daily cap.
+ */
+function AiCard() {
+  const aiEnabled = useAppStore((s) => s.aiEnabled);
+  const setAiEnabled = useAppStore((s) => s.setAiEnabled);
+
+  const [keyDraft, setKeyDraft] = useState('');
+  const [editingKey, setEditingKey] = useState(false);
+  const [tick, setTick] = useState(0); // refresh non-reactive key/usage reads
+
+  const hasKey = tick >= 0 && getApiKey().length > 0;
+  const keyMask = describeApiKey();
+  const used = tick >= 0 ? getUsageToday() : 0;
+
+  const saveKey = () => {
+    const trimmed = keyDraft.trim();
+    if (!trimmed) return;
+    setApiKey(trimmed);
+    setKeyDraft('');
+    setEditingKey(false);
+    setTick((t) => t + 1);
+    toast.success('API key saved', { description: 'Stored on this device only — never synced.' });
+  };
+
+  const removeKey = () => {
+    clearApiKey();
+    setTick((t) => t + 1);
+    toast('API key removed from this device');
+  };
+
+  return (
+    <Section icon={Sparkles} title="AI note review" testid="ai-card">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium">Check notes for unclear wording or grammar</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            An editor that flags unclear spots and suggests fixes — it never changes your note on its own.
+          </p>
+        </div>
+        <Switch
+          checked={aiEnabled}
+          onCheckedChange={(on) => {
+            setAiEnabled(on);
+            if (on) setEditingKey(!getApiKey());
+          }}
+          aria-label="Enable AI note review"
+          data-testid="ai-switch"
+        />
+      </div>
+
+      {aiEnabled && (
+        <div className="mt-3 space-y-3">
+          {/* Disclosure — stated plainly, once, at opt-in (plan §7). */}
+          <p
+            className="rounded-lg bg-muted/60 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground"
+            data-testid="ai-disclosure"
+          >
+            To review a note, its text and the linked task title are sent from your device to
+            OpenAI, using your own API key. Your notes stay in your account and on this device,
+            reviews you keep are stored in your app data, and your key is stored only on this
+            device.
+          </p>
+
+          {/* Key custody — BYOK, device-local (plan §6.1). */}
+          {hasKey && !editingKey ? (
+            <div className="flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5">
+              <span className="flex min-w-0 items-center gap-2 text-sm">
+                <KeyRound className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                <span className="truncate font-mono text-xs tabular-nums">{keyMask}</span>
+              </span>
+              <span className="flex shrink-0 gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 rounded-lg text-xs"
+                  onClick={() => {
+                    setKeyDraft('');
+                    setEditingKey(true);
+                  }}
+                  data-testid="ai-key-replace"
+                >
+                  Replace
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 rounded-lg text-xs text-destructive hover:text-destructive"
+                  onClick={removeKey}
+                  data-testid="ai-key-remove"
+                >
+                  Remove
+                </Button>
+              </span>
+            </div>
+          ) : (
+            <div className="space-y-2 rounded-xl border px-3 py-2.5">
+              <Label htmlFor="ai-key" className="text-sm">
+                OpenAI API key
+              </Label>
+              <Input
+                id="ai-key"
+                type="password"
+                value={keyDraft}
+                onChange={(e) => setKeyDraft(e.target.value)}
+                placeholder="sk-…"
+                autoComplete="off"
+                aria-label="OpenAI API key"
+                data-testid="ai-key-input"
+              />
+              <div className="flex items-center justify-between gap-2">
+                <a
+                  href="https://platform.openai.com/api-keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                  data-testid="ai-key-link"
+                >
+                  Get an API key
+                  <ExternalLink className="size-3" aria-hidden />
+                </a>
+                <span className="flex gap-1.5">
+                  {hasKey && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 rounded-lg text-xs"
+                      onClick={() => setEditingKey(false)}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    className="h-8 rounded-lg text-xs"
+                    disabled={!keyDraft.trim()}
+                    onClick={saveKey}
+                    data-testid="ai-key-save"
+                  >
+                    Save key
+                  </Button>
+                </span>
+              </div>
+              {!hasKey && (
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  The key is stored on this device only and never synced. For extra privacy, open
+                  your OpenAI account → Data controls and turn off training on API data.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Usage vs. the daily cap (plan §6.3). */}
+          <p className="text-xs tabular-nums text-muted-foreground" data-testid="ai-usage">
+            {used} of {DAILY_REVIEW_CAP} reviews used today · re-reading a saved review is free
+          </p>
+        </div>
       )}
     </Section>
   );

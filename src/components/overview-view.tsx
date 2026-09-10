@@ -17,7 +17,7 @@ import {
 import { useAppStore } from '@/store/use-app-store';
 import { LogRow } from '@/components/log-row';
 import { friendlyDayLabel, formatDuration, parseDayKey, planDayLabel } from '@/lib/format';
-import { taskColorMeta, iconMeta } from '@/lib/task-style';
+import { iconMeta, taskColorMeta } from '@/lib/task-style';
 import { foldColorDotsByDay } from '@/lib/logs';
 import { cn } from '@/lib/utils';
 import { CalendarPlus } from 'lucide-react';
