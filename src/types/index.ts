@@ -156,6 +156,12 @@ export interface NoteInput {
   taskId?: string | null;
   /** Day the linked task belongs to; defaults to today when linking. */
   taskDateKey?: string | null;
+  /**
+   * Day the note itself belongs to ("yyyy-MM-dd") — lets a note written
+   * today be filed under yesterday (back-fill). Defaults to today; the
+   * store clamps future dates back to today.
+   */
+  dateKey?: string | null;
 }
 
 /** Input shape for creating a log via manual backfill (§3.1). */

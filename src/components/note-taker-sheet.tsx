@@ -45,6 +45,11 @@ interface DayAttempt {
  *                     that day's tasks, save. Completed tasks show their
  *                     finish time; pending ones show their slot.
  *
+ * The Day row (below the composer) picks which day the note itself is
+ * filed under — today by default, one tap back per day to back-fill
+ * ("I forgot to write this yesterday"). Moving it also moves the task
+ * picker's day, so linking to yesterday's task stays one tap.
+ *
  * When AI review is enabled, a "Review with AI" button sits directly
  * above Save (plan §4.1): the review runs on the UNSAVED draft, and any
  * answers flow back into the draft, so every change is visible before
@@ -102,6 +107,8 @@ function NoteTakerFields({
   const [linkTouched, setLinkTouched] = useState(presetTaskId != null);
   /** Day being browsed in the picker (defaults to today). */
   const [browseDateKey, setBrowseDateKey] = useState(todayKey());
+  /** Day the note itself is filed under — today unless back-filled. */
+  const [noteDateKey, setNoteDateKey] = useState(todayKey());
 
   const tasks = useMemo(() => selectSortedActiveTasks(tasksRecord), [tasksRecord]);
 
@@ -110,6 +117,17 @@ function NoteTakerFields({
 
   const shiftBrowse = (days: number) => {
     setBrowseDateKey(dateKeyOf(addDays(parseDayKey(browseDateKey), days)));
+  };
+
+  /** Back-fill: move the note's own day (never into the future), and
+   *  carry the task picker along — writing about yesterday usually means
+   *  linking to yesterday's tasks. The picker stays free to browse
+   *  elsewhere afterwards; the carry only happens on explicit day moves. */
+  const shiftNoteDay = (days: number) => {
+    const next = dateKeyOf(addDays(parseDayKey(noteDateKey), days));
+    if (next < minDateKey || next > todayKey()) return;
+    setNoteDateKey(next);
+    setBrowseDateKey(next);
   };
 
   /** Latest attempt per task on the browsed day (logs are day-bucketed). */
@@ -136,9 +154,10 @@ function NoteTakerFields({
 
   /**
    * Save and DONE (v2.1) — the write is the last thing this sheet shows.
-   * The toast carries the outcome (linked task, when there is one); a
-   * quick note needs no description because the new note is visible on
-   * Today the moment the sheet closes. No interstitial, no Done tap.
+   * The toast carries the outcome (linked task, and the filed day when
+   * the note is back-filled — it won't be on Today, so say where it went);
+   * a same-day quick note needs no description because the new note is
+   * visible on Today the moment the sheet closes. No interstitial, no Done tap.
    */
   const save = () => {
     const trimmed = text.trim();
@@ -147,11 +166,23 @@ function NoteTakerFields({
       text: trimmed,
       taskId: linkedTaskId ?? null,
       taskDateKey: linkedTaskId ? (linkedDateKey ?? todayKey()) : null,
+      dateKey: noteDateKey,
     });
+    const backfilled = noteDateKey !== todayKey();
+    const linkedPart = note.taskTitle
+      ? `Linked to "${note.taskTitle}"${
+          linkedDateKey && linkedDateKey !== todayKey()
+            ? ` · ${friendlyDayLabel(linkedDateKey)}`
+            : ''
+        }`
+      : undefined;
+    // Back-filled notes say where they landed — the Today list won't show them.
+    const dayPart = backfilled ? `Filed under ${friendlyDayLabel(noteDateKey)}` : undefined;
     toast.success('Note saved', {
-      description: note.taskTitle
-        ? `Linked to "${note.taskTitle}"${linkedDateKey && linkedDateKey !== todayKey() ? ` · ${friendlyDayLabel(linkedDateKey)}` : ''}`
-        : undefined,
+      description:
+        linkedPart && dayPart && linkedDateKey !== noteDateKey
+          ? `${linkedPart} · ${dayPart}`
+          : (linkedPart ?? dayPart),
     });
     onCancel();
   };
@@ -166,7 +197,7 @@ function NoteTakerFields({
     setDraftReview({
       text: trimmed,
       taskId: linkedTaskId,
-      dateKey: linkedTaskId ? (linkedDateKey ?? todayKey()) : todayKey(),
+      dateKey: linkedTaskId ? (linkedDateKey ?? noteDateKey) : noteDateKey,
       seq: Date.now(),
     });
     setReviewOpen(true);
@@ -246,6 +277,44 @@ function NoteTakerFields({
           className="max-h-[260px] min-h-[140px] resize-none overflow-y-auto"
           data-testid="note-text-input"
         />
+
+        {/* Which day the note belongs to — today by default; step back
+            to back-fill a forgotten note. Mirrors the link row's style. */}
+        <div
+          className="flex items-center justify-between rounded-xl border px-3.5 py-2"
+          data-testid="note-day-row"
+        >
+          <Label className="text-sm">Day</Label>
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => shiftNoteDay(-1)}
+              disabled={noteDateKey <= minDateKey}
+              aria-label="Note is for the previous day"
+              data-testid="note-day-prev"
+              className="grid size-7 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground disabled:opacity-30"
+            >
+              <ChevronLeft className="size-4" />
+            </button>
+            <span
+              className={cn(
+                'min-w-[92px] text-center text-sm font-semibold tabular-nums',
+                noteDateKey === todayKey() ? 'text-foreground' : 'text-primary',
+              )}
+              data-testid="note-day-label"
+            >
+              {friendlyDayLabel(noteDateKey)}
+            </span>
+            <button
+              onClick={() => shiftNoteDay(1)}
+              disabled={noteDateKey >= todayKey()}
+              aria-label="Note is for the next day"
+              data-testid="note-day-next"
+              className="grid size-7 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground disabled:opacity-30"
+            >
+              <ChevronRight className="size-4" />
+            </button>
+          </div>
+        </div>
 
         {/* Linked → a removable chip. Unlinked → the optional toggle + picker. */}
         {linkedTask ? (

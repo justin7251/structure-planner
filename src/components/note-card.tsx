@@ -11,8 +11,10 @@ export type NoteOutcome = 'done' | 'missed';
  * appears (Today's notes list, the Week review panel). Full text always
  * renders; the meta row shows the task anchor (or "Quick note"), the
  * capture time, and — when the caller knows it — whether the linked
- * task ended up done or missed. Delete stays inline: notes are tiny,
- * low-stakes artifacts, a confirm would cost more than it saves.
+ * task ended up done or missed. Back-filled notes also show the day
+ * they are filed under (skipped when the linked task's day already says
+ * the same thing). Delete stays inline: notes are tiny, low-stakes
+ * artifacts, a confirm would cost more than it saves.
  */
 export function NoteCard({
   note,
@@ -30,6 +32,13 @@ export function NoteCard({
   /** data-testid namespace, so each surface keeps its own hooks. */
   testidPrefix?: string;
 }) {
+  // The note's own filed day — shown only when it isn't today (Today's
+  // list never needs it) and isn't already told by the linked task's day.
+  const filedDayLabel =
+    note.dateKey !== todayKey() && note.dateKey !== note.taskDateKey
+      ? friendlyDayLabel(note.dateKey)
+      : null;
+
   return (
     <div
       className="group relative rounded-2xl border bg-card/60 px-3.5 py-3"
@@ -62,6 +71,12 @@ export function NoteCard({
           <>
             <NotebookPen className="size-3 shrink-0" aria-hidden />
             <span>Quick note</span>
+            <span aria-hidden>·</span>
+          </>
+        )}
+        {filedDayLabel && (
+          <>
+            <span className="shrink-0">{filedDayLabel}</span>
             <span aria-hidden>·</span>
           </>
         )}

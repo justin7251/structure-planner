@@ -564,6 +564,15 @@ export const useAppStore = create<AppState>()(
         }
         const task = input.taskId ? state.tasks[input.taskId] : undefined;
         const nowIso = new Date().toISOString();
+        // Day the note is filed under — today by default, an earlier day
+        // when back-filling ("I forgot to write this yesterday"). Future
+        // dates and malformed keys fall back to today; `createdAt` stays
+        // the real write time so sync ordering and capture time survive.
+        const today = todayKey();
+        const dateKey =
+          input.dateKey && /^\d{4}-\d{2}-\d{2}$/.test(input.dateKey) && input.dateKey <= today
+            ? input.dateKey
+            : today;
         const note: Note = {
           id: genId('note'),
           text,
@@ -572,8 +581,8 @@ export const useAppStore = create<AppState>()(
           // task is later deleted or archived (same trick as Log.taskTitle).
           taskTitle: task?.title ?? null,
           // Which day the linked task belongs to (the picker's date when linking).
-          taskDateKey: task ? (input.taskDateKey ?? todayKey()) : null,
-          dateKey: todayKey(),
+          taskDateKey: task ? (input.taskDateKey ?? today) : null,
+          dateKey,
           createdAt: nowIso,
           updatedAt: nowIso,
         };
